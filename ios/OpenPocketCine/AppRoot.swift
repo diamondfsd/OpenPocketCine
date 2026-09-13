@@ -272,6 +272,13 @@ final class AppModel {
 
     func prepareStartup() {
         savedCameras = SavedCameraStore.load()
+        #if DEBUG
+            if let mock = MockCameraConfiguration.fromLaunchArguments() {
+                isPairingNewCamera = false
+                session.connectMock(mock)
+                return
+            }
+        #endif
         switch CameraStartupPolicy.launchDestination(savedCameras: savedCameras) {
         case .addCamera:
             isPairingNewCamera = true

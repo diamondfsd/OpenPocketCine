@@ -651,6 +651,86 @@ final class CameraSession {
         }
     }
 
+    #if DEBUG
+        /// Simulator-only path that exercises the production datalink against the Node mock.
+        func connectMock(_ configuration: MockCameraConfiguration) {
+            let camera = FoundCamera(
+                id: UUID(uuidString: "00000000-0000-4000-8000-000000000004")!,
+                name: configuration.name,
+                model: configuration.model,
+                modelId: configuration.modelId)
+            connectGeneration += 1
+            let generation = connectGeneration
+            abortInFlightRun()
+            reconnectTarget = nil
+            isReconnecting = false
+            connectedCamera = camera
+            phase = .openingDatalink
+            runTask = Task {
+                defer {
+                    if generation == connectGeneration { runTask = nil }
+                }
+                do {
+                    try await runMock(camera, configuration: configuration)
+                } catch is CancellationError {
+                    return
+                } catch {
+                    guard generation == connectGeneration, !Task.isCancelled else { return }
+                    let why = (error as? LocalizedError)?.errorDescription ?? "\(error)"
+                    ControlLiveLog.line("session: mock connect failed at \(phase.label) — \(why)")
+                    phase = .failed(why)
+                    applyLinkPresentation()
+                }
+            }
+        }
+
+        private func runMock(
+            _ camera: FoundCamera, configuration: MockCameraConfiguration
+        ) async throws {
+            connectedCamera = camera
+            joinedSSID = configuration.ssid
+            rawAccessUnits = 0
+            rawFramesEnqueued = 0
+            lastIdrRequest = Date.distantPast
+            liveViewEnableSent = false
+            liveViewEnableSends = 0
+            resetFirstPictureFormatPoke()
+            idrHoldEnableCount = 0
+            audioRefreshPending = true
+            glamourClearPending = true
+            focusTrackPending = true
+            faceAFArmTask?.cancel()
+            faceAFArmTask = nil
+            faceAFArmed = false
+            firstPictureSettled = false
+            needsForegroundRecover = false
+            resetLinkHealthMeasurements()
+            resetFeedWatchdog()
+            if !holdsMonitor { decoder.reset() }
+            resetGimbalPoseForNewStream()
+            decoder.beginIDRHold()
+
+            let dl = DatalinkDriver(
+                port: configuration.udpPort,
+                tcpPoke: camera.model.tcpPoke,
+                pairingToken: camera.model.pairingToken,
+                stationHost: configuration.host,
+                tcpPort: configuration.tcpPort,
+                mockPath: true)
+            wireDatalink(dl)
+            datalink = dl
+            try await dl.open {
+                guard self.shouldCommitLiveHandshake(dl) else { return }
+                self.phase = .live
+                self.applyLinkPresentation()
+                self.beginIDRHoldIfNeeded()
+                self.sendInitialLiveViewEnable(
+                    displayAttached: self.decoder.isDisplayReady, pathProven: true)
+            }
+            startKeepalive(ssid: configuration.ssid, useBLE: false)
+        }
+    #endif
+
     func disconnect() {
         if isMultiviewBorrowed {
             releaseMultiview()
@@ -3436,13 +3516,13 @@ final class CameraSession {
 
     // ---- keepalive -------------------------------------------------------------------------------
 
-    private func startKeepalive(ssid: String?) {
-        cameraPathRecovery.reset()
+    private func startKeepalive(ssid: String?, useBLE: Bool = true) {
+        if useBLE { cameraPathRecovery.reset() }
         keepaliveLoop?.cancel()
         keepaliveLoop = Task {
             while !Task.isCancelled {
-                if recoverLostCameraPathIfNeeded() { return }
-                ble.send(Commands.sessionKeepalive())
+                if useBLE, recoverLostCameraPathIfNeeded() { return }
+                if useBLE { ble.send(Commands.sessionKeepalive()) }
                 if ssid != nil, holdsMonitor {
                     datalink?.keepalive()
                     publishPipelineStats()
@@ -3471,12 +3551,12 @@ final class CameraSession {
                     }
                     let rx = rxAge.map { String(format: "%.1f", $0) } ?? "—"
                     let tx = txAge.map { String(format: "%.1f", $0) } ?? "—"
-                    if !isBrowsingMedia, rxAge == nil || rxAge! >= 2 {
+                    if useBLE && !isBrowsingMedia && (rxAge == nil || rxAge! >= 2) {
                         ControlLiveLog.line(
                             "flip: beat tx=\(tx)s rx=\(rx)s ble-fallback=1"
                         )
                         ble.send(Commands.getSelfieFlip())
-                    } else {
+                    } else if useBLE {
                         ControlLiveLog.line("flip: beat tx=\(tx)s rx=\(rx)s ble-fallback=0")
                     }
                 }

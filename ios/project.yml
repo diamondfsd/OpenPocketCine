@@ -78,6 +78,56 @@ targets:
       Debug: OpenPocketCine/Frameio.xcconfig
       Release: OpenPocketCine/Frameio.xcconfig
 
+  # Simulator E2E target: the production app embeds the watch app, which requires
+  # a matching watchOS Simulator runtime even when only the iOS app is tested.
+  OpenPocketCineSimulator:
+    type: application
+    platform: iOS
+    sources:
+      - OpenPocketCine
+    dependencies:
+      - package: OpenPocketViewCore
+        product: OpenPocketViewCore
+    settings:
+      base:
+        SWIFT_VERSION: "5.0"
+        PRODUCT_BUNDLE_IDENTIFIER: com.opencapture.openpocketcine.simulator
+        PRODUCT_NAME: OpenPocketCineSimulator
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGN_ENTITLEMENTS: OpenPocketCine/OpenPocketCine.entitlements
+        GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) CI_SILENCE_GL_DEPRECATION=1"
+        OTHER_SWIFT_FLAGS: "$(inherited) -Xcc -DCI_SILENCE_GL_DEPRECATION"
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: OpenPocketCine Simulator
+        INFOPLIST_KEY_CFBundleName: OpenPocketCine Simulator
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
+        INFOPLIST_KEY_UIFileSharingEnabled: YES
+        INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace: YES
+        INFOPLIST_KEY_GCSupportsControllerUserInteraction: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UIUserInterfaceStyle: Dark
+        INFOPLIST_KEY_UIStatusBarStyle: UIStatusBarStyleLightContent
+        INFOPLIST_KEY_UIStatusBarHidden: YES
+        INFOPLIST_KEY_UIViewControllerBasedStatusBarAppearance: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        INFOPLIST_KEY_CADisableMinimumFrameDurationOnPhone: YES
+        INFOPLIST_KEY_UIRequiresFullScreen: YES
+        INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription: "OpenPocketCine uses Bluetooth to find and pair with your DJI Osmo Pocket and hand off Wi-Fi."
+        INFOPLIST_KEY_NSMotionUsageDescription: "OpenPocketCine uses headphone motion so AirPods can aim the gimbal."
+        INFOPLIST_KEY_NSAppTransportSecurity_NSAllowsLocalNetworking: YES
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: "OpenPocketCine connects to cameras over local Wi-Fi to receive video and control them, and can share the live picture with nearby OpenPocketCine phones."
+        INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription: "OpenPocketCine saves clips you choose to Photos."
+        INFOPLIST_FILE: OpenPocketCine/Info-Frameio.plist
+        # XcodeGen's local package target writes its module under the repository root build directory.
+        # Keep the simulator target buildable from xcodebuild as well as Xcode.
+        SWIFT_ENABLE_EXPLICIT_MODULES: NO
+        SWIFT_INCLUDE_PATHS: "$(inherited) $(PROJECT_DIR)/../build/$(CONFIGURATION)$(EFFECTIVE_PLATFORM_NAME)"
+    configFiles:
+      Debug: OpenPocketCine/Frameio.xcconfig
+      Release: OpenPocketCine/Frameio.xcconfig
+
   OpenPocketCineTests:
     type: bundle.unit-test
     platform: iOS
@@ -134,6 +184,10 @@ schemes:
     test:
       targets:
         - OpenPocketCineTests
+  OpenPocketCineSimulator:
+    build:
+      targets:
+        OpenPocketCineSimulator: all
   OpenPocketCineWatch:
     build:
       targets:

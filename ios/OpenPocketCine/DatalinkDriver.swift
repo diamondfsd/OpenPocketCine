@@ -16,6 +16,7 @@ import os
 final class DatalinkDriver {
     private let stationHost: String?
     private let stationHotspot: Bool
+    private let mockPath: Bool
     #if DEBUG
         private var usesLoopbackForTesting = false
         /// Runs the real UDP handshake/recovery against a deterministic local peer.
@@ -35,12 +36,14 @@ final class DatalinkDriver {
         #if DEBUG
             if usesLoopbackForTesting { return true }
         #endif
+        if mockPath { return true }
         return stationHost == nil
             ? WiFiJoiner.isCameraPathReady()
             : SharedWiFiPath.address(hotspot: stationHotspot) != nil
     }
     nonisolated private let initialStationWindow = OSAllocatedUnfairLock(initialState: UInt16?.none)
     private let port: UInt16
+    private let tcpPort: UInt16
     private let tcpPoke: Bool
     private let pairingToken: String
     nonisolated private let q = DispatchQueue(label: "opv.datalink.udp")
@@ -204,12 +207,14 @@ final class DatalinkDriver {
 
     init(
         port: UInt16, tcpPoke: Bool, pairingToken: String, stationHost: String? = nil,
-        stationHotspot: Bool = false
+        stationHotspot: Bool = false, tcpPort: UInt16 = 7001, mockPath: Bool = false
     ) {
         self.stationHost = stationHost
         self.stationHotspot = stationHotspot
+        self.mockPath = mockPath
         self.port = port
         self.tcpPoke = tcpPoke
+        self.tcpPort = tcpPort
         self.pairingToken = pairingToken
         q.setSpecific(key: Self.qKey, value: 1)
     }
@@ -1602,6 +1607,7 @@ final class DatalinkDriver {
         #if DEBUG
             if usesLoopbackForTesting { return }
         #endif
+        if mockPath { return }
         if stationHost == nil {
             try await WiFiJoiner.waitUntilCameraPathReady(timeout: timeout)
         } else if !pathReady {
@@ -1613,6 +1619,11 @@ final class DatalinkDriver {
         #if DEBUG
             if usesLoopbackForTesting { return }
         #endif
+        if mockPath {
+            cameraLocalIPv4 = nil
+            cameraInterface = nil
+            return
+        }
         if stationHost != nil {
             cameraLocalIPv4 = SharedWiFiPath.address(hotspot: stationHotspot)
             cameraInterface = nil
@@ -1645,6 +1656,11 @@ final class DatalinkDriver {
         #if DEBUG
             if usesLoopbackForTesting { return p }
         #endif
+        if mockPath {
+            p.prohibitedInterfaceTypes = [.cellular]
+            p.allowLocalEndpointReuse = true
+            return p
+        }
         p.prohibitedInterfaceTypes = [.cellular]
         p.allowLocalEndpointReuse = true
         var boundLocal = false
@@ -1771,7 +1787,7 @@ final class DatalinkDriver {
 
     private func poke7001Once() async throws {
         let tcp = NWConnection(
-            host: NWEndpoint.Host(remoteHost), port: 7001, using: wifiTCP())
+            host: NWEndpoint.Host(remoteHost), port: NWEndpoint.Port(rawValue: tcpPort)!, using: wifiTCP())
         pokeConn = tcp
         try await start(tcp, timeout: 2)
         tcp.send(
