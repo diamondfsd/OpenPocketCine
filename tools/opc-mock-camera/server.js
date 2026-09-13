@@ -134,6 +134,10 @@ function isRequest(frame) {
   return frame.flags === 0x40 || frame.flags === 0x00 || frame.flags === 0x80;
 }
 
+function isNotification(frame) {
+  return frame.flags === 0x00 && frame.cmdSet === 0x04 && [0x01, 0x14].includes(frame.cmdId);
+}
+
 function jsonSafeState(state) {
   return {
     model: state.profile.id,
@@ -142,6 +146,7 @@ function jsonSafeState(state) {
     firmware: state.firmware,
     paired: state.paired,
     recording: state.recording,
+    recordingDurationSeconds: state.recordingElapsedSeconds(),
     inPlayback: state.inPlayback,
     liveEnabled: state.liveEnabled,
     stationMode: state.stationMode,
@@ -153,6 +158,7 @@ function jsonSafeState(state) {
     isoLimit: state.isoLimit,
     ev: state.ev,
     color: state.color,
+    fov: state.fov,
     focusMode: state.focusMode,
     focusTrack: state.focusTrack,
     whiteBalance: { mode: state.wbMode, kelvin: state.wbKelvin, tint: state.wbTint },
@@ -280,9 +286,11 @@ class MockCameraServer {
         subscriptions: new Map(),
         nextSubscriptionId: 0x69df,
         mediaPhase: "idle",
+        focusTapPhase: "idle",
         recentCommands: new Map(),
         liveTimer: null,
         statusTimer: null,
+        statusTick: 0,
         videoIndex: 0,
       };
       this.sessions.set(key, session);
@@ -442,6 +450,7 @@ class MockCameraServer {
       session.subscriptions.clear();
       session.nextSubscriptionId = 0x69df;
       session.mediaPhase = "idle";
+      session.focusTapPhase = "idle";
       session.recentCommands.clear();
     } else {
       this.metrics.duplicatePackets += 1;
@@ -463,7 +472,7 @@ class MockCameraServer {
     const expectedReceiver = this.expectedReceiver(frame);
     if (this.options.strictProtocol && frame.sender !== 0x02) return invalid(0xdf, "command sender must be the app address 0x02");
     if (this.options.strictProtocol && expectedReceiver !== null && !expectedReceiver.includes(frame.receiver)) return invalid(0xdf, `receiver 0x${frame.receiver.toString(16)} is invalid for ${key}`);
-    const expectedFlags = key === "00/81" ? 0x80 : 0x40;
+    const expectedFlags = key === "00/81" ? 0x80 : isNotification(frame) ? 0x00 : 0x40;
     if (this.options.strictProtocol && frame.flags !== expectedFlags) return invalid(0xdf, `${key} must use request flags 0x${expectedFlags.toString(16)}`);
 
     const lifecycle = this.validateLifecycle(frame, session);
@@ -540,6 +549,15 @@ class MockCameraServer {
     }
     if (key === "02/09" && frame.payload[10] === 3 && session.nanoLiveGate) return reject("Nano live gate is already enabled");
     if (key === "02/09" && frame.payload[10] === 4 && !session.nanoLiveGate) return reject("Nano live gate cannot stop before it starts");
+
+    const tapSequence = {
+      "02/22": ["idle", "prepared"],
+      "02/30": ["prepared", "point"],
+      "02/32": ["hint", "idle"],
+    }[key];
+    if (tapSequence && session.focusTapPhase !== tapSequence[0]) return reject(`tap focus is out of order: expected ${tapSequence[0]}, got ${session.focusTapPhase}`);
+    if (key === "02/68" && !["idle", "point"].includes(session.focusTapPhase)) return reject(`tap focus is out of order: expected point or a normal live prepare, got ${session.focusTapPhase}`);
+    if (!tapSequence && key !== "02/68" && session.focusTapPhase !== "idle" && key !== "00/88") return reject(`tap focus is out of order: expected the next tap-focus step, got ${key}`);
     return null;
   }
 
@@ -548,8 +566,14 @@ class MockCameraServer {
       case "00/81": session.registered = true; break;
       case "00/88": session.presence = true; session.lastPresenceAt = Date.now(); break;
       case "03/da": session.gimbalReady = true; break;
-      case "02/68": session.livePrepare = true; break;
+      case "02/68":
+        session.livePrepare = true;
+        if (session.focusTapPhase === "point") session.focusTapPhase = "hint";
+        break;
       case "02/09": session.nanoLiveGate = frame.payload[10] === 3; break;
+      case "02/22": session.focusTapPhase = "prepared"; break;
+      case "02/30": session.focusTapPhase = "point"; break;
+      case "02/32": session.focusTapPhase = "idle"; break;
       case "00/99": session.subscribed = true; break;
       case "00/26":
         if (frame.payload[1] === 0x04) session.mediaPhase = "triggered";
@@ -558,7 +582,6 @@ class MockCameraServer {
         break;
       case "02/0c":
         if (frame.payload[3] === 1) {
-          session.livePrepare = false;
           session.nanoLiveGate = false;
         }
         break;
@@ -612,7 +635,8 @@ class MockCameraServer {
       session.subscribed = true;
       this.pushSubscription(session, subscription.name, subscription.subId);
       if (session.subscriptions.size === 1) {
-        for (const status of this.state.statusFrames()) this.pushFrame(session, { ...status, sender: 0x01, receiver: 0x02, seq: session.nextDataSeq }, `push-${opcode(status)}`);
+        for (const status of this.state.statusFrames()) this.pushFrame(session, { ...status, sender: status.cmdSet === 0x04 ? 0x04 : 0x01, receiver: 0x02, seq: session.nextDataSeq }, `push-${opcode(status)}`);
+        this.startStatus(session);
       }
     }
     if (key === "07/ab" && validation.ok) {
@@ -622,11 +646,11 @@ class MockCameraServer {
     if (key === "02/09" && validation.ok && frame.payload[10] === 4) this.stopLive(session);
     if (key === "02/0c" && validation.ok && frame.payload[3] === 1) this.stopLive(session);
     let responsePacket = null;
-    if (validation.ok && !this.options.dropAcks) {
+    if (validation.ok && !this.options.dropAcks && !isNotification(frame)) {
       const payload = this.replyPayload(frame);
       const flags = frame.cmdSet === 0x04 || frame.cmdSet === 0x03 ? FLAG_ACK_80 : FLAG_RESPONSE;
       responsePacket = this.sendReply(session, responseFrame(frame, payload, flags, frame.cmdSet === 0x04 ? 0x04 : 0x01));
-    } else if (!validation.ok && !this.options.dropAcks) {
+    } else if (!validation.ok && !this.options.dropAcks && !isNotification(frame)) {
       const flags = frame.cmdSet === 0x04 || frame.cmdSet === 0x03 ? FLAG_ACK_80 : FLAG_RESPONSE;
       responsePacket = this.sendReply(session, responseFrame(frame, Buffer.from([validation.code]), flags, frame.cmdSet === 0x04 ? 0x04 : 0x01));
     }
@@ -634,6 +658,7 @@ class MockCameraServer {
       setImmediate(() => this.sendMediaManifest(session, frame));
     }
     if (validation.ok && ["02/02", "02/0c", "02/18", "02/1e", "02/24", "02/28", "02/2a", "02/2c", "02/2e", "02/30", "02/32", "02/42", "02/8e", "02/9f", "02/a6", "02/b8", "04/14", "04/4c", "04/50"].includes(key)) this.pushAllSubscriptions(session);
+    if (validation.ok && (key === "04/01" || key === "04/14" || key === "04/4c" || key === "04/50")) this.pushGimbalStatus(session);
     return responsePacket;
   }
 
@@ -678,7 +703,29 @@ class MockCameraServer {
 
   pushAllSubscriptions(session) {
     for (const [name, subId] of session.subscriptions) this.pushSubscription(session, name, subId);
-    for (const frame of this.state.statusFrames()) this.pushFrame(session, { ...frame, sender: 0x01, receiver: 0x02, seq: session.nextDataSeq }, `push-${opcode(frame)}`);
+    for (const frame of this.state.statusFrames()) this.pushFrame(session, { ...frame, sender: frame.cmdSet === 0x04 ? 0x04 : 0x01, receiver: 0x02, seq: session.nextDataSeq }, `push-${opcode(frame)}`);
+  }
+
+  pushGimbalStatus(session) {
+    if (this.stopped || !session.handshaken || !session.subscribed) return;
+    for (const frame of this.state.statusFrames().filter((candidate) => candidate.cmdSet === 0x04)) {
+      this.pushFrame(session, { ...frame, sender: 0x04, receiver: 0x02, seq: session.nextDataSeq }, `push-${opcode(frame)}`);
+    }
+  }
+
+  startStatus(session) {
+    if (session.statusTimer) return;
+    session.statusTick = 0;
+    session.statusTimer = setInterval(() => {
+      if (this.stopped || !session.handshaken || !session.subscribed) return;
+      this.pushGimbalStatus(session);
+      session.statusTick += 1;
+      if (session.statusTick % 10 !== 0) return;
+      for (const [name, subId] of session.subscriptions) this.pushSubscription(session, name, subId);
+      for (const status of this.state.statusFrames().filter((candidate) => candidate.cmdSet !== 0x04)) {
+        this.pushFrame(session, { ...status, sender: 0x01, receiver: 0x02, seq: session.nextDataSeq }, `push-${opcode(status)}`);
+      }
+    }, 100);
   }
 
   pushSubscription(session, name, subId) {
@@ -743,7 +790,11 @@ class MockCameraServer {
   }
 
   startLive(session) {
-    if (session.liveTimer || !this.videoAUs.length || this.options.dropVideo) return;
+    if (!this.videoAUs.length || this.options.dropVideo) return;
+    // Each enable is the mock's deterministic IDR boundary. Restarting the
+    // source here lets recovery tests begin with the same parameter sets.
+    session.videoIndex = 0;
+    if (session.liveTimer) return;
     session.liveTimer = setInterval(() => this.sendVideo(session), 40);
     this.log("live", { action: "start", peer: session.key, sourceAUs: this.videoAUs.length });
   }
@@ -1025,7 +1076,7 @@ export function applyControlPatch(state, patch) {
   if (!patch || typeof patch !== "object" || Array.isArray(patch)) throw new Error("patch must be an object");
   const allowed = new Set([
     "recording", "inPlayback", "liveEnabled", "stationMode", "streaming", "shootingMode", "expoMode",
-    "shutterDenom", "isoIndex", "isoLimit", "ev", "color", "focusMode", "focusTrack", "audioChannel",
+    "shutterDenom", "isoIndex", "isoLimit", "ev", "color", "fov", "focusMode", "focusTrack", "audioChannel",
     "vocalBoost", "selfieFlip", "tracking", "zoomLens", "batteryPercent", "batteryMilliVolts",
     "batteryMilliAmps", "charging", "docked", "sdTotalMb", "sdFreeMb", "internalTotalMb", "internalFreeMb",
     "focusPoint", "wb",
@@ -1051,6 +1102,7 @@ export function applyControlPatch(state, patch) {
     isoLimit: state.isoLimit,
     ev: state.ev,
     color: state.color,
+    fov: state.fov,
     focusMode: state.focusMode,
     focusTrack: state.focusTrack,
     audioChannel: state.audioChannel,
@@ -1078,7 +1130,7 @@ export function applyControlPatch(state, patch) {
 
   const integerRanges = {
     shootingMode: [0, 0xff], expoMode: [0, 0xff], shutterDenom: [1, 16000], isoIndex: [0, 0xff],
-    isoLimit: [0, 0xff], ev: [0, 0xff], color: [0, 0xff], focusMode: [1, 2], focusTrack: [0, 3], vocalBoost: [0, 1],
+    isoLimit: [0, 0xff], ev: [0, 0xff], color: [0, 0xff], fov: [1, 5], focusMode: [1, 2], focusTrack: [0, 3], vocalBoost: [0, 1],
     audioChannel: [1, 3], zoomLens: [217, 2604], batteryPercent: [0, 100], batteryMilliVolts: [0, 10000],
     batteryMilliAmps: [-100000, 100000], sdTotalMb: [0, 0xffffffff], sdFreeMb: [0, 0xffffffff],
     internalTotalMb: [0, 0xffffffff], internalFreeMb: [0, 0xffffffff],
@@ -1111,6 +1163,12 @@ export function applyControlPatch(state, patch) {
 
   if (candidate.recording && candidate.inPlayback) throw new Error("recording and inPlayback cannot both be true");
   if (candidate.liveEnabled && candidate.inPlayback) throw new Error("liveEnabled and inPlayback cannot both be true");
+  if (!state.profile.modes.includes(candidate.shootingMode)) throw new Error(`shootingMode ${candidate.shootingMode} is not supported by ${state.profile.id}`);
+  if (!state.profile.colors.includes(candidate.color)) throw new Error(`color ${candidate.color} is not supported by ${state.profile.id}`);
+  if (![0x01, 0x05].includes(candidate.fov)) throw new Error(`fov ${candidate.fov} is not supported`);
+  if (!state.profile.supportsFocus && (candidate.focusMode !== state.focusMode || candidate.focusTrack !== state.focusTrack || candidate.focusX !== state.focusX || candidate.focusY !== state.focusY)) throw new Error(`${state.profile.id} does not support camera focus`);
+  const zoomBounds = state.zoomLensBounds({ shootingMode: candidate.shootingMode });
+  if (candidate.zoomLens < zoomBounds.min || candidate.zoomLens > zoomBounds.max) throw new Error(`zoomLens must be between ${zoomBounds.min} and ${zoomBounds.max} for ${state.profile.id}`);
   if (candidate.sdFreeMb > candidate.sdTotalMb) throw new Error("sdFreeMb cannot exceed sdTotalMb");
   if (candidate.internalFreeMb > candidate.internalTotalMb) throw new Error("internalFreeMb cannot exceed internalTotalMb");
 

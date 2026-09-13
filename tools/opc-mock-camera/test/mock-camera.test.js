@@ -13,6 +13,7 @@ import {
   FLAG_RESPONSE,
   PKT_HANDSHAKE,
   PKT_TELEMETRY,
+  PKT_VIDEO,
   ProtocolError,
   decodeDuml,
   decodeTransport,
@@ -197,6 +198,45 @@ function waitMs(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+async function openLiveSession(server, model = "pocket4pro") {
+  const udp = await bindUdp();
+  const collector = new UdpCollector(udp);
+  const serverPort = server.udp.address().port;
+  const sessionId = model === "nano" ? 0x7788 : 0x7787;
+  const baseSeq = model === "nano" ? 0x4800 : 0x4400;
+  let transportSeq = baseSeq + 8;
+  let commandCounter = 1;
+  let frameSeq = 0x600;
+
+  const issue = async (command, expectReply = true) => {
+    const waiter = expectReply
+      ? collector.waitForFrame((candidate) => candidate.seq === command.seq && candidate.cmdSet === command.cmdSet && candidate.cmdId === command.cmdId && candidate.flags === replyFlags(command))
+      : null;
+    await sendUdp(udp, wrapCommand(command, { sessionId, transportSeq, cmdCounter: commandCounter }), serverPort);
+    transportSeq = (transportSeq + 8) & 0xffff;
+    commandCounter = (commandCounter + 1) & 0xff;
+    if (!waiter) {
+      await waitMs(25);
+      return null;
+    }
+    return (await waiter).frames.find((candidate) => candidate.seq === command.seq && candidate.cmdSet === command.cmdSet && candidate.cmdId === command.cmdId).payload;
+  };
+
+  await sendUdp(udp, handshakeDatagram({ sessionId, seq: baseSeq, baseSeq }), serverPort);
+  await collector.waitFor((event) => event.packet.pktType === PKT_HANDSHAKE);
+  await collector.waitFor((event) => event.packet.pktType === PKT_TELEMETRY);
+
+  const next = (overrides) => frame({ seq: frameSeq++, ...overrides });
+  assert.deepEqual(await issue(next({ receiver: 0x48, flags: 0x80, cmdSet: 0x00, cmdId: 0x81, payload: registerPayload() })), Buffer.from([0]));
+  assert.deepEqual(await issue(next({ receiver: 0x28, cmdSet: 0x00, cmdId: 0x88, payload: presencePayload() })), Buffer.from([0]));
+  if (model !== "nano") assert.deepEqual(await issue(next({ receiver: 0x03, cmdSet: 0x03, cmdId: 0xda, payload: Buffer.from([5, 0xff, 0xff, 0xff, 0xff]) })), Buffer.from([0]));
+  assert.deepEqual(await issue(next({ receiver: 0x28, cmdSet: 0x00, cmdId: 0x99, payload: subscriptionPayload("camcap_video_format", 0x69df) })), Buffer.from([0]));
+  if (model === "nano") assert.deepEqual(await issue(next({ receiver: 0x01, cmdSet: 0x02, cmdId: 0x09, payload: Buffer.from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]) })), Buffer.from([0]));
+  else assert.deepEqual(await issue(next({ receiver: 0x01, cmdSet: 0x02, cmdId: 0x68, payload: Buffer.from([8]) })), Buffer.from([0]));
+  assert.deepEqual(await issue(next({ receiver: model === "nano" ? 0x41 : 0x08, cmdSet: 0x09, cmdId: 0xa8, payload: Buffer.from([0, 4, 2, 0, 0, 0, 0, 0, 0, 0]) })), Buffer.from([0]));
+  return { udp, collector, issue, next };
+}
+
 function replyFlags(command) {
   return command.cmdSet === 0x03 || command.cmdSet === 0x04 ? 0x80 : FLAG_RESPONSE;
 }
@@ -254,6 +294,14 @@ test("public entrypoint exports the server and rejects malformed control patches
   assert.throws(() => publicApi.applyControlPatch(state, { sdFreeMb: 200000 }), /sdFreeMb cannot exceed sdTotalMb/);
   assert.equal(state.sdFreeMb, 96000);
   assert.throws(() => publicApi.applyControlPatch(state, { vocalBoost: true }), /vocalBoost must be an integer/);
+  publicApi.applyControlPatch(state, { fov: 5 });
+  assert.equal(state.fov, 5);
+  assert.throws(() => publicApi.applyControlPatch(state, { fov: 2 }), /fov 2 is not supported/);
+
+  const nano = new MockCameraState({ model: "nano" });
+  assert.throws(() => publicApi.applyControlPatch(nano, { zoomLens: 218 }), /zoomLens must be between 217 and 217/);
+  assert.throws(() => publicApi.applyControlPatch(nano, { focusMode: 2 }), /does not support camera focus/);
+  assert.equal(nano.zoomLens, 217);
 });
 
 test("session 53/10 returns the captured four-byte wake reply", () => {
@@ -285,6 +333,271 @@ test("profiles enforce Nano live routing and camera state transitions", () => {
   assert.equal(pocket.validate(frame({ cmdSet: 0x02, cmdId: 0x01, payload: Buffer.from([1]) })).ok, false);
   pocket.shootingMode = 0x17;
   assert.equal(pocket.validate(frame({ cmdSet: 0x02, cmdId: 0x01, payload: Buffer.from([1]) })).ok, true);
+});
+
+test("profiles enforce model-specific zoom and focus capabilities", () => {
+  const pro = new MockCameraState({ model: "pocket4pro" });
+  const pocket4 = new MockCameraState({ model: "pocket4" });
+  const pocket3 = new MockCameraState({ model: "pocket3" });
+  const nano = new MockCameraState({ model: "nano" });
+  const zoom = (lens) => frame({ cmdSet: 0x02, cmdId: 0xb8, payload: Buffer.from([0x0a, 0x4e, lens & 0xff, lens >> 8]) });
+
+  assert.equal(pro.validate(zoom(2604)).ok, true);
+  pro.shootingMode = 0x00;
+  assert.equal(pro.validate(zoom(651)).ok, true);
+  assert.equal(pro.validate(zoom(652)).code, 0xdf);
+  assert.equal(pocket4.validate(zoom(868)).ok, true);
+  assert.equal(pocket4.validate(zoom(869)).code, 0xdf);
+  pocket3.videoResolution = 0x10;
+  assert.equal(pocket3.validate(zoom(434)).ok, true);
+  assert.equal(pocket3.validate(zoom(435)).code, 0xdf);
+  assert.equal(pocket3.validate(frame({ cmdSet: 0x02, cmdId: 0xb8, payload: Buffer.from([1, 0x48, 1, 0]) })).ok, true);
+  pocket3.apply(frame({ cmdSet: 0x02, cmdId: 0xb8, payload: Buffer.from([1, 0x48, 1, 0]) }));
+  assert.equal(pocket3.zoomLens, 434);
+  assert.equal(nano.validate(zoom(217)).ok, true);
+  assert.equal(nano.validate(zoom(218)).code, 0xdf);
+  assert.equal(nano.validate(frame({ cmdSet: 0x02, cmdId: 0x24, payload: Buffer.from([1]) })).code, 0xe0);
+});
+
+test("control state machine mutates valid gimbal, lens, focus, exposure, and capture commands", () => {
+  const state = new MockCameraState({ model: "pocket4pro" });
+  const applyValid = (command) => {
+    const validation = state.validate(command);
+    assert.equal(validation.ok, true, validation.reason);
+    state.apply(command);
+  };
+  const assertRejectedWithoutMutation = (command, code) => {
+    const before = JSON.stringify({
+      zoomLens: state.zoomLens,
+      gimbal: state.gimbal,
+      focusX: state.focusX,
+      focusY: state.focusY,
+      trackingBox: state.trackingBox,
+    });
+    const validation = state.validate(command);
+    assert.equal(validation.ok, false);
+    assert.equal(validation.code, code);
+    assert.equal(JSON.stringify({
+      zoomLens: state.zoomLens,
+      gimbal: state.gimbal,
+      focusX: state.focusX,
+      focusY: state.focusY,
+      trackingBox: state.trackingBox,
+    }), before);
+  };
+
+  applyValid(frame({ cmdSet: 0x04, cmdId: 0x01, receiver: 0x04, flags: 0x00, payload: Buffer.from([0x1a, 0x06, 0, 0, 0x00, 0x04, 0, 0x80, 0x22, 0]) }));
+  assert.equal(state.gimbal.axis0, 1562);
+  assert.equal(state.gimbal.axis1, 1024);
+
+  const target = Buffer.alloc(8);
+  target.writeInt16LE(500, 0);
+  target.writeInt16LE(-200, 4);
+  target[6] = 5;
+  target[7] = 20;
+  applyValid(frame({ cmdSet: 0x04, cmdId: 0x14, receiver: 0x04, flags: 0x00, payload: target }));
+  assert.equal(state.gimbal.yaw, 50);
+  assert.equal(state.gimbal.pitch, -20);
+  applyValid(frame({ cmdSet: 0x04, cmdId: 0x4c, receiver: 0x04, payload: Buffer.from([0, 8]) }));
+  assert.equal(state.gimbal.modeFamily, 0);
+  applyValid(frame({ cmdSet: 0x04, cmdId: 0x50, receiver: 0x04, payload: Buffer.from([0, 5, 1, 2]) }));
+  assert.equal(state.gimbal.speed, 2);
+  assertRejectedWithoutMutation(frame({ cmdSet: 0x04, cmdId: 0x01, receiver: 0x04, flags: 0x00, payload: Buffer.from([0, 0, 0, 0, 0, 0, 0, 0x80, 0x22, 0]) }), 0xdf);
+  assertRejectedWithoutMutation(frame({ cmdSet: 0x04, cmdId: 0x14, receiver: 0x04, flags: 0x00, payload: Buffer.from([0, 0, 1, 0, 0, 0, 5, 1]) }), 0xdf);
+
+  applyValid(frame({ cmdSet: 0x02, cmdId: 0xb8, payload: Buffer.from([0x0a, 0x4e, 0x8b, 0x02]) }));
+  assert.equal(state.zoomLens, 651);
+  applyValid(frame({ cmdSet: 0x02, cmdId: 0xb8, payload: Buffer.from([0x03, 0x00, 0x64, 0x00]) }));
+  applyValid(frame({ cmdSet: 0x02, cmdId: 0xb8, payload: Buffer.from([0xff, 0, 0, 0]) }));
+  assertRejectedWithoutMutation(frame({ cmdSet: 0x02, cmdId: 0xb8, payload: Buffer.from([0x0a, 0x4e, 0x2d, 0x0a]) }), 0xdf);
+
+  const focusPoint = Buffer.alloc(21);
+  focusPoint.writeFloatLE(0.25, 0);
+  focusPoint.writeFloatLE(0.75, 4);
+  applyValid(frame({ cmdSet: 0x02, cmdId: 0x30, payload: focusPoint }));
+  assert.equal(state.focusX, 0.25);
+  assert.equal(state.focusY, 0.75);
+  const tracking = Buffer.alloc(21);
+  tracking[0] = 1;
+  tracking.writeUInt16LE(7, 3);
+  tracking.writeFloatLE(0.2, 5);
+  tracking.writeFloatLE(0.3, 9);
+  tracking.writeFloatLE(0.4, 13);
+  tracking.writeFloatLE(0.5, 17);
+  applyValid(frame({ cmdSet: 0x02, cmdId: 0xa6, payload: tracking }));
+  assert.equal(state.trackingBox.id, 7);
+  assert.equal(state.tracking, true);
+  applyValid(frame({ cmdSet: 0x02, cmdId: 0xa6, payload: Buffer.alloc(21) }));
+  assert.equal(state.tracking, false);
+
+  applyValid(frame({ cmdSet: 0x02, cmdId: 0x1e, payload: Buffer.from([4, 0]) }));
+  applyValid(frame({ cmdSet: 0x02, cmdId: 0x28, payload: Buffer.from([1, 0xf4, 0x81, 0, 0, 0, 0x40]) }));
+  applyValid(frame({ cmdSet: 0x02, cmdId: 0x2a, payload: Buffer.from([6]) }));
+  applyValid(frame({ cmdSet: 0x02, cmdId: 0x2c, payload: Buffer.from([6, 0x38, 0, 0xfe, 0xff]) }));
+  applyValid(frame({ cmdSet: 0x02, cmdId: 0x2e, payload: Buffer.from([0x13]) }));
+  assert.equal(state.expoMode, 4);
+  assert.equal(state.shutterDenom, 500);
+  assert.equal(state.isoIndex, 6);
+  assert.equal(state.wbKelvin, 5600);
+  assert.equal(state.wbTint, -2);
+  assert.equal(state.ev, 0x13);
+
+  const fovSet = frame({ cmdSet: 0x02, cmdId: 0x8e, payload: Buffer.from([1, 1, 0x09, 0, 1, 5]) });
+  applyValid(fovSet);
+  assert.equal(state.fov, 5);
+  const fovGet = frame({ cmdSet: 0x02, cmdId: 0x8e, payload: Buffer.from([0, 1, 0x09, 0]) });
+  assert.equal(state.validate(fovGet).ok, true);
+  assert.deepEqual(state.paramValue(0x0009), Buffer.from([5]));
+  assert.equal(state.validate(frame({ cmdSet: 0x02, cmdId: 0x8e, payload: Buffer.from([1, 1, 0x09, 0, 1, 2]) })).code, 0xdf);
+
+  const mediaBeforePhoto = state.media.length;
+  applyValid(frame({ cmdSet: 0x02, cmdId: 0xe1, payload: Buffer.from([0x17]) }));
+  applyValid(frame({ cmdSet: 0x02, cmdId: 0x01, payload: Buffer.from([1]) }));
+  assert.equal(state.media.length, mediaBeforePhoto + 1);
+  const internalFreeAfterPhoto = state.internalFreeMb;
+  assert.ok(internalFreeAfterPhoto < 24000);
+  applyValid(frame({ cmdSet: 0x02, cmdId: 0xe1, payload: Buffer.from([1]) }));
+  assertRejectedWithoutMutation(frame({ cmdSet: 0x02, cmdId: 0x01, payload: Buffer.from([1]) }), 0xd9);
+
+  applyValid(frame({ cmdSet: 0x02, cmdId: 0x02, payload: Buffer.from([1]) }));
+  assert.equal(state.recording, true);
+  assert.equal(state.validate(frame({ cmdSet: 0x02, cmdId: 0x0c, payload: Buffer.from([1, 1, 0, 1]) })).code, 0xd9);
+  applyValid(frame({ cmdSet: 0x02, cmdId: 0x02, payload: Buffer.from([0]) }));
+  assert.equal(state.recording, false);
+  assert.equal(state.media.length, mediaBeforePhoto + 2);
+  assert.ok(state.internalFreeMb < internalFreeAfterPhoto);
+});
+
+test("UDP live session delivers preview and enforces control protocol", async (t) => {
+  const mediaRoot = await mkdtemp(path.join(os.tmpdir(), "opc-mock-video-"));
+  const videoSource = path.join(mediaRoot, "preview.hex");
+  const accessUnits = [
+    Buffer.concat([Buffer.from([0, 0, 0, 1, 0x40, 1]), Buffer.alloc(1400, 0x55)]),
+    Buffer.from([0, 0, 0, 1, 0x02, 1, 0x01]),
+  ];
+  await writeFile(videoSource, `${accessUnits.map((accessUnit) => accessUnit.toString("hex")).join("\n")}\n`, "ascii");
+  const server = await startServer(["--video-source", videoSource]);
+  let live;
+  t.after(async () => {
+    live?.udp.close();
+    server.stop();
+    await rm(mediaRoot, { recursive: true, force: true });
+    await waitMs(20);
+  });
+
+  live = await openLiveSession(server);
+  const videoEvents = () => live.collector.events.filter((event) => event.packet.pktType === PKT_VIDEO);
+  const firstVideo = await live.collector.waitFor((event) => event.packet.pktType === PKT_VIDEO);
+  assert.equal(firstVideo.packet.sessionId, 0x7787);
+  assert.equal(firstVideo.packet.seq, 0x4400);
+  assert.deepEqual(firstVideo.packet.payload.subarray(12, 16), Buffer.from([0, 0, 1, 0xff]));
+  assert.equal(firstVideo.packet.payload.readUInt32LE(16), accessUnits[0].length);
+
+  const enterPlayback = live.next({ receiver: 0x01, cmdSet: 0x02, cmdId: 0x0c, payload: Buffer.from([1, 1, 0, 1]) });
+  assert.deepEqual(await live.issue(enterPlayback), Buffer.from([0]));
+  const exitPlayback = live.next({ receiver: 0x01, cmdSet: 0x02, cmdId: 0x0c, payload: Buffer.from([1, 1, 0, 0]) });
+  assert.deepEqual(await live.issue(exitPlayback), Buffer.from([0]));
+  const resumedEnable = live.next({ receiver: 0x08, cmdSet: 0x09, cmdId: 0xa8, payload: Buffer.from([0, 4, 2, 0, 0, 0, 0, 0, 0, 0]) });
+  const videoCountBeforeResume = videoEvents().length;
+  assert.deepEqual(await live.issue(resumedEnable), Buffer.from([0]));
+  await live.collector.waitFor((event) => event.packet.pktType === PKT_VIDEO && videoEvents().length > videoCountBeforeResume);
+
+  const fovSet = live.next({ receiver: 0x01, cmdSet: 0x02, cmdId: 0x8e, payload: Buffer.from([1, 1, 0x09, 0, 1, 5]) });
+  assert.deepEqual(await live.issue(fovSet), Buffer.from([0]));
+  const fovGet = live.next({ receiver: 0x01, cmdSet: 0x02, cmdId: 0x8e, payload: Buffer.from([0, 1, 0x09, 0]) });
+  assert.deepEqual(await live.issue(fovGet), Buffer.from([0, 0, 1, 0x09, 0, 1, 5]));
+
+  const zoom = live.next({ receiver: 0x01, cmdSet: 0x02, cmdId: 0xb8, payload: Buffer.from([0x0a, 0x4e, 0x2c, 0x0a]) });
+  assert.deepEqual(await live.issue(zoom), Buffer.from([0]));
+  assert.equal(server.state.zoomLens, 2604);
+  const invalidZoom = live.next({ receiver: 0x01, cmdSet: 0x02, cmdId: 0xb8, payload: Buffer.from([0x0a, 0x4e, 0x2d, 0x0a]) });
+  assert.deepEqual(await live.issue(invalidZoom), Buffer.from([0xdf]));
+  assert.equal(server.state.zoomLens, 2604);
+
+  const recenter = live.next({ receiver: 0x04, cmdSet: 0x04, cmdId: 0x4c, payload: Buffer.from([0xfe, 8]) });
+  assert.deepEqual(await live.issue(recenter), Buffer.from([0]));
+  const flip = live.next({ receiver: 0x04, cmdSet: 0x04, cmdId: 0x4c, payload: Buffer.from([0xfe, 9]) });
+  assert.deepEqual(await live.issue(flip), Buffer.from([0]));
+  assert.equal(server.state.gimbal.face, 1);
+  const mode = live.next({ receiver: 0x04, cmdSet: 0x04, cmdId: 0x4c, payload: Buffer.from([1, 8]) });
+  assert.deepEqual(await live.issue(mode), Buffer.from([0]));
+  const speed = live.next({ receiver: 0x04, cmdSet: 0x04, cmdId: 0x50, payload: Buffer.from([0, 5, 1, 2]) });
+  assert.deepEqual(await live.issue(speed), Buffer.from([0]));
+  assert.equal(server.state.gimbal.modeFamily, 1);
+  assert.equal(server.state.gimbal.speed, 2);
+
+  const target = Buffer.alloc(8);
+  target.writeInt16LE(500, 0);
+  target.writeInt16LE(-200, 4);
+  target[6] = 5;
+  target[7] = 20;
+  const timedTarget = live.next({ receiver: 0x04, flags: 0, cmdSet: 0x04, cmdId: 0x14, payload: target });
+  await live.issue(timedTarget, false);
+  await waitMs(20);
+  assert.equal(server.state.gimbal.yaw, 50);
+  assert.equal(server.state.gimbal.pitch, -20);
+
+  const focusPoint = Buffer.alloc(21);
+  focusPoint.writeFloatLE(0.25, 0);
+  focusPoint.writeFloatLE(0.75, 4);
+  const focusOutOfOrder = live.next({ receiver: 0x01, cmdSet: 0x02, cmdId: 0x30, payload: focusPoint });
+  assert.deepEqual(await live.issue(focusOutOfOrder), Buffer.from([0xd9]));
+  const focusPrepare = live.next({ receiver: 0x01, cmdSet: 0x02, cmdId: 0x22, payload: Buffer.from([2]) });
+  assert.deepEqual(await live.issue(focusPrepare), Buffer.from([0]));
+  const focusPointValid = live.next({ receiver: 0x01, cmdSet: 0x02, cmdId: 0x30, payload: focusPoint });
+  assert.deepEqual(await live.issue(focusPointValid), Buffer.from([0]));
+  const focusHint = live.next({ receiver: 0x01, cmdSet: 0x02, cmdId: 0x68, payload: Buffer.from([8]) });
+  assert.deepEqual(await live.issue(focusHint), Buffer.from([0]));
+  const focusCommit = Buffer.alloc(20);
+  focusCommit.set([0, 2, 1, 0]);
+  focusCommit.writeFloatLE(0.25, 4);
+  focusCommit.writeFloatLE(0.75, 8);
+  const focusCommitFrame = live.next({ receiver: 0x01, cmdSet: 0x02, cmdId: 0x32, payload: focusCommit });
+  assert.deepEqual(await live.issue(focusCommitFrame), Buffer.from([0]));
+  assert.equal(server.state.focusX, 0.25);
+  assert.equal(server.state.focusY, 0.75);
+
+  const directionLock = live.next({ receiver: 0x04, cmdSet: 0x04, cmdId: 0x4c, payload: Buffer.from([0, 8]) });
+  assert.deepEqual(await live.issue(directionLock), Buffer.from([0]));
+  const attitude = await live.collector.waitForFrame((candidate) => candidate.cmdSet === 0x04 && candidate.cmdId === 0x05 && candidate.payload[6] === 0);
+  assert.equal(attitude.frames.find((candidate) => candidate.cmdId === 0x05).payload[6], 0);
+
+  const stick = live.next({
+    receiver: 0x04,
+    flags: 0,
+    cmdSet: 0x04,
+    cmdId: 0x01,
+    payload: Buffer.from([0, 4, 0, 0, 0, 4, 0, 0x80, 0x22, 0]),
+  });
+  const eventsBeforeStick = live.collector.events.length;
+  await live.issue(stick, false);
+  await waitMs(50);
+  const stickReplies = live.collector.events
+    .slice(eventsBeforeStick)
+    .flatMap((event) => event.frames)
+    .filter((candidate) => candidate.seq === stick.seq && candidate.cmdSet === 0x04 && candidate.cmdId === 0x01 && candidate.flags === 0x80);
+  assert.equal(stickReplies.length, 0);
+  assert.equal(server.state.gimbal.axis0, 1024);
+  assert.equal(server.state.gimbal.axis1, 1024);
+
+  const invalidAeRegion = Buffer.alloc(20);
+  invalidAeRegion.set([0, 2, 1, 0]);
+  invalidAeRegion.writeFloatLE(0.25, 4);
+  invalidAeRegion.writeFloatLE(0.75, 8);
+  const outOfOrder = live.next({ receiver: 0x01, cmdSet: 0x02, cmdId: 0x32, payload: invalidAeRegion });
+  assert.deepEqual(await live.issue(outOfOrder), Buffer.from([0xd9]));
+  assert.ok(server.metrics.stateRejected >= 1);
+
+  const stopVideo = await httpRequest(server.http.address().port, "/control", { "Content-Type": "application/json" }, "POST", JSON.stringify({ action: "fault", name: "dropVideo", value: true }));
+  assert.equal(stopVideo.status, 200);
+  const videoCountAtStop = videoEvents().length;
+  await waitMs(100);
+  assert.equal(videoEvents().length, videoCountAtStop);
+
+  const resumeVideo = await httpRequest(server.http.address().port, "/control", { "Content-Type": "application/json" }, "POST", JSON.stringify({ action: "fault", name: "dropVideo", value: false }));
+  assert.equal(resumeVideo.status, 200);
+  await waitMs(100);
+  assert.ok(videoEvents().length > videoCountAtStop);
 });
 
 test("media manifest exposes parser-compatible handles and resolution", () => {

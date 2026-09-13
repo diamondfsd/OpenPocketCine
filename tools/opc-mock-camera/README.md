@@ -50,7 +50,7 @@ The server implements the current app path for:
   response packets.
 - Registration, presence, subscriptions and status pushes.
 - Record/photo/mode, exposure, ISO, shutter, white balance, focus, zoom,
-  tracking, audio parameters, gimbal commands, playback and live-view enable.
+  FOV, tracking, audio parameters, gimbal commands, playback and live-view enable.
 - Pocket live enable `0x09/0xa8` with receiver `0x08`; Nano live gate
   `0x02/0x09` plus `0x09/0xa8` receiver `0x41`.
 - Media list `0x00/0x26` and chunked CompositePack `0x00/0x27`, delete and

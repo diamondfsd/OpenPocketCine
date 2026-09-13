@@ -23,6 +23,8 @@ const PROFILES = {
     dspLength: 26,
     internalStorage: true,
     hasGimbal: true,
+    supportsFocus: true,
+    modes: [0x00, 0x01, 0x02, 0x0a, 0x17, 0x28],
   },
   pocket4: {
     name: "Osmo Pocket 4",
@@ -33,6 +35,8 @@ const PROFILES = {
     dspLength: 26,
     internalStorage: true,
     hasGimbal: true,
+    supportsFocus: true,
+    modes: [0x00, 0x01, 0x02, 0x0a, 0x17, 0x28],
   },
   pocket3: {
     name: "Osmo Pocket 3",
@@ -43,6 +47,8 @@ const PROFILES = {
     dspLength: 27,
     internalStorage: false,
     hasGimbal: true,
+    supportsFocus: true,
+    modes: [0x00, 0x01, 0x02, 0x0a, 0x17, 0x28],
   },
   nano: {
     name: "Osmo Nano",
@@ -53,6 +59,8 @@ const PROFILES = {
     dspLength: 26,
     internalStorage: false,
     hasGimbal: false,
+    supportsFocus: false,
+    modes: [0x00, 0x01, 0x02, 0x05, 0x0a],
   },
 };
 
@@ -155,6 +163,7 @@ export class MockCameraState {
     this.firmware = options.firmware || "01.00.00.00";
     this.paired = options.paired !== false;
     this.recording = false;
+    this.recordingStartedAt = null;
     this.inPlayback = false;
     this.liveEnabled = false;
     this.stationMode = false;
@@ -166,6 +175,7 @@ export class MockCameraState {
     this.isoLimit = 0x07;
     this.ev = 0x10;
     this.color = this.profile.colors[0];
+    this.fov = 0x01;
     this.focusMode = 0x01;
     this.focusTrack = 0x00;
     this.wbMode = 0x00;
@@ -183,7 +193,16 @@ export class MockCameraState {
     this.tracking = false;
     this.trackingBox = null;
     this.zoomLens = 217;
-    this.gimbal = { yaw: 0, pitch: 0, tiltLock: 0, speed: 1, face: 0, axis0: 1024, axis1: 1024 };
+    this.gimbal = {
+      yaw: 0,
+      pitch: 0,
+      tiltLock: 0,
+      speed: 1,
+      face: 0,
+      modeFamily: 2,
+      axis0: 1024,
+      axis1: 1024,
+    };
     this.batteryPercent = 83;
     this.batteryMilliVolts = 3900;
     this.batteryMilliAmps = -420;
@@ -243,10 +262,12 @@ export class MockCameraState {
           break;
         case "02/0c":
           if (!frame.payload.equals(Buffer.from([1, 1, 0, 0])) && !frame.payload.equals(Buffer.from([1, 1, 0, 1]))) throw new ProtocolError("playback payload must enter or exit", "PLAYBACK_VALUE");
+          if (frame.payload[3] === 1 && this.recording) throw new ProtocolError("playback cannot start while recording", "PLAYBACK_STATE");
           if ((frame.payload[3] === 1 && this.inPlayback) || (frame.payload[3] === 0 && !this.inPlayback)) throw new ProtocolError("playback state does not allow this transition", "PLAYBACK_STATE");
           break;
         case "09/a8":
           if (frame.receiver !== this.profile.receiver || !frame.payload.equals(Buffer.from([0, 4, 2, 0, 0, 0, 0, 0, 0, 0]))) throw new ProtocolError(`live enable requires receiver 0x${this.profile.receiver.toString(16)} and the captured payload`, "LIVE_ENABLE_VALUE");
+          if (this.inPlayback) throw new ProtocolError("live view cannot start during playback", "LIVE_STATE");
           break;
         case "02/09":
           if (this.profile.id !== "nano" || frame.payload.length !== 11 || ![3, 4].includes(frame.payload[10])) throw new ProtocolError("Nano live gate is only 11 bytes ending in 03 or 04", "NANO_GATE_VALUE");
@@ -260,14 +281,14 @@ export class MockCameraState {
           if (this.inPlayback || this.recording || !this.isPhotoMode()) throw new ProtocolError("photo is not available in the current camera state", "PHOTO_STATE");
           break;
         case "02/e1":
-          if (frame.payload.length !== 1 || ![0, 1, 2, 5, 0x0a, 0x17, 0x28, 0x1a].includes(frame.payload[0])) throw new ProtocolError("shooting mode is not in the captured table", "MODE_VALUE");
-          if (frame.payload[0] === 5 && this.profile.id !== "nano") throw new ProtocolError("mode 05 is Nano photo only", "MODE_MODEL");
+          if (frame.payload.length !== 1 || !this.profile.modes.includes(frame.payload[0])) throw new ProtocolError("shooting mode is not supported by this body", "MODE_VALUE");
           if (this.inPlayback || this.recording) throw new ProtocolError("shooting mode cannot change while recording or in playback", "MODE_STATE");
           break;
         case "08/e1":
           if (frame.payload.length !== 1 || ![1, 0x1a].includes(frame.payload[0])) throw new ProtocolError("multicam mode must be Video or livestream", "MULTICAM_MODE_VALUE");
           break;
         case "02/18":
+          if (this.recording || this.inPlayback) throw new ProtocolError("video format cannot change while recording or in playback", "VIDEO_FORMAT_STATE");
           if (frame.payload.length !== 5 || frame.payload[2] !== 0 || frame.payload[3] !== 0 || frame.payload[4] !== 0 || !this.profile.formats.some(([r, f]) => r === frame.payload[0] && f === frame.payload[1])) throw new ProtocolError("resolution/fps pair is not advertised by this body", "VIDEO_FORMAT_VALUE");
           break;
         case "02/1e":
@@ -286,6 +307,7 @@ export class MockCameraState {
           if (frame.payload.length !== 1 || !this.profile.colors.includes(frame.payload[0])) throw new ProtocolError("color mode is not supported by this body", "COLOR_VALUE");
           break;
         case "02/24":
+          if (!this.profile.supportsFocus) throw new ProtocolError("this profile has no camera focus", "UNSUPPORTED");
           if (frame.payload.length !== 1 || ![1, 2].includes(frame.payload[0])) throw new ProtocolError("focus mode must be 01 or 02", "FOCUS_VALUE");
           break;
         case "02/2c": {
@@ -300,15 +322,19 @@ export class MockCameraState {
           if (frame.payload.length !== 1 || frame.payload[0] < 7 || frame.payload[0] > 0x19) throw new ProtocolError("EV is outside -3..+3", "EV_VALUE");
           break;
         case "02/22":
+          if (!this.profile.supportsFocus) throw new ProtocolError("this profile has no camera focus", "UNSUPPORTED");
           if (!frame.payload.equals(Buffer.from([2]))) throw new ProtocolError("AE meter hint must be 02", "AE_METER_VALUE");
           break;
         case "02/30":
-          if (frame.payload.length !== 21 || !validFloat(frame.payload, 0) || !validFloat(frame.payload, 4) || frame.payload.readFloatLE(0) < 0 || frame.payload.readFloatLE(0) > 1 || frame.payload.readFloatLE(4) < 0 || frame.payload.readFloatLE(4) > 1) throw new ProtocolError("focus point must contain normalized x/y", "FOCUS_POINT_VALUE");
+          if (!this.profile.supportsFocus) throw new ProtocolError("this profile has no camera focus", "UNSUPPORTED");
+          if (frame.payload.length !== 21 || !validFloat(frame.payload, 0) || !validFloat(frame.payload, 4) || frame.payload.readFloatLE(0) < 0 || frame.payload.readFloatLE(0) > 1 || frame.payload.readFloatLE(4) < 0 || frame.payload.readFloatLE(4) > 1 || frame.payload.subarray(8).some((value) => value !== 0)) throw new ProtocolError("focus point must contain normalized x/y and zero reserved bytes", "FOCUS_POINT_VALUE");
           break;
         case "02/32":
-          if (frame.payload.length !== 20 || !validFloat(frame.payload, 4) || !validFloat(frame.payload, 8) || frame.payload.readFloatLE(4) < 0 || frame.payload.readFloatLE(4) > 1 || frame.payload.readFloatLE(8) < 0 || frame.payload.readFloatLE(8) > 1) throw new ProtocolError("AE region must contain normalized x/y", "AE_REGION_VALUE");
+          if (!this.profile.supportsFocus) throw new ProtocolError("this profile has no camera focus", "UNSUPPORTED");
+          if (frame.payload.length !== 20 || !frame.payload.subarray(0, 4).equals(Buffer.from([0, 2, 1, 0])) || !validFloat(frame.payload, 4) || !validFloat(frame.payload, 8) || frame.payload.readFloatLE(4) < 0 || frame.payload.readFloatLE(4) > 1 || frame.payload.readFloatLE(8) < 0 || frame.payload.readFloatLE(8) > 1 || frame.payload.subarray(12).some((value) => value !== 0)) throw new ProtocolError("AE region must contain normalized x/y and the captured reserved bytes", "AE_REGION_VALUE");
           break;
         case "02/68":
+          if (this.profile.id === "nano") throw new ProtocolError("Nano does not use the Pocket live preparation command", "UNSUPPORTED");
           if (!frame.payload.equals(Buffer.from([8]))) throw new ProtocolError("live prepare must be 08", "LIVE_PREPARE_VALUE");
           break;
         case "02/8e":
@@ -336,15 +362,17 @@ export class MockCameraState {
           break;
         case "04/01":
           if (!this.profile.hasGimbal) throw new ProtocolError("this profile has no gimbal", "UNSUPPORTED");
-          if (frame.payload.length !== 10 || frame.payload[2] !== 0 || frame.payload[3] !== 0 || !frame.payload.subarray(6).equals(Buffer.from([0, 0x80, 0x22, 0]))) throw new ProtocolError("invalid gimbal stick payload", "GIMBAL_STICK_VALUE");
+          if (frame.payload.length !== 10 || u16le(frame.payload, 0) < 474 || u16le(frame.payload, 0) > 1574 || frame.payload[2] !== 0 || frame.payload[3] !== 0 || u16le(frame.payload, 4) < 474 || u16le(frame.payload, 4) > 1574 || !frame.payload.subarray(6).equals(Buffer.from([0, 0x80, 0x22, 0]))) throw new ProtocolError("invalid gimbal stick payload", "GIMBAL_STICK_VALUE");
           break;
         case "04/14":
           if (!this.profile.hasGimbal) throw new ProtocolError("this profile has no gimbal", "UNSUPPORTED");
-          if (frame.payload.length !== 8 || ![4, 5].includes(frame.payload[6]) || frame.payload[7] < 1) throw new ProtocolError("invalid timed gimbal payload", "GIMBAL_ANGLE_VALUE");
+          if (frame.payload.length !== 8 || frame.payload[2] !== 0 || frame.payload[3] !== 0 || ![4, 5].includes(frame.payload[6]) || frame.payload[7] < 1) throw new ProtocolError("invalid timed gimbal payload", "GIMBAL_ANGLE_VALUE");
+          if (frame.payload[6] === 4 && (i16le(frame.payload, 0) !== 0 || i16le(frame.payload, 4) !== 0)) throw new ProtocolError("timed gimbal stop must use zero angles", "GIMBAL_ANGLE_VALUE");
+          if (frame.payload[6] === 5 && (i16le(frame.payload, 0) < -480 || i16le(frame.payload, 0) > 2250 || i16le(frame.payload, 4) < -1800 || i16le(frame.payload, 4) > 1800)) throw new ProtocolError("timed gimbal angle is outside the captured reach", "GIMBAL_ANGLE_VALUE");
           break;
         case "04/4c":
           if (!this.profile.hasGimbal) throw new ProtocolError("this profile has no gimbal", "UNSUPPORTED");
-          if (![[0xfe, 8], [0xfe, 9], [2, 8], [1, 8]].some((pair) => frame.payload.equals(Buffer.from(pair)))) throw new ProtocolError("unknown gimbal command", "GIMBAL_COMMAND_VALUE");
+          if (![[0xfe, 8], [0xfe, 9], [2, 8], [1, 8], [0, 8]].some((pair) => frame.payload.equals(Buffer.from(pair)))) throw new ProtocolError("unknown gimbal command", "GIMBAL_COMMAND_VALUE");
           break;
         case "04/50":
           if (!this.profile.hasGimbal) throw new ProtocolError("this profile has no gimbal", "UNSUPPORTED");
@@ -406,12 +434,13 @@ export class MockCameraState {
     const set = payload[0] === 1 && payload[1] === 1;
     if (!get && !set) throw new ProtocolError("param verb is not GET or SET", "PARAM_VERB");
     const pid = u16le(payload, 2);
-    const supported = new Set([0x000f, 0x0020, 0x0038, 0x0039, 0x003b, 0x004c]);
+    const supported = new Set([0x0009, 0x000f, 0x0020, 0x0038, 0x0039, 0x003b, 0x004c]);
     if (!supported.has(pid)) throw new ProtocolError(`param 0x${pid.toString(16).padStart(4, "0")} is not supported`, "UNSUPPORTED");
     if (get && payload.length !== 4) throw new ProtocolError("param GET must be 4 bytes", "PARAM_GET_LENGTH");
     if (set) {
       if (payload.length < 5 || payload.length !== 5 + payload[4]) throw new ProtocolError("param SET length mismatch", "PARAM_SET_LENGTH");
       const value = payload.subarray(5);
+      if (pid === 0x0009 && ![0x01, 0x05].includes(value[0])) throw new ProtocolError("FOV must be Wide (01) or Natural Wide (05)", "FOV_VALUE");
       if (pid === 0x0038) throw new ProtocolError("selfie flip is camera-owned and cannot be SET", "UNSUPPORTED");
       if (pid === 0x0039 && value.length !== 62) throw new ProtocolError("glamour blob must be 62 bytes", "GLAMOUR_LENGTH");
       if (pid === 0x003b && (value.length !== 2 || value[0] !== 1 || value[1] > 3)) throw new ProtocolError("focus-track SET must be 01 00..03", "FOCUS_TRACK_VALUE");
@@ -435,13 +464,27 @@ export class MockCameraState {
     if (payload.length !== 4) throw new ProtocolError("zoom payload must be 4 bytes", "ZOOM_LENGTH");
     if (payload[0] === 0x0a && payload[1] === 0x4e) {
       const lens = u16le(payload, 2);
-      if (lens < 217 || lens > 2604) throw new ProtocolError("zoom lens position is outside 1x..12x", "ZOOM_VALUE");
+      const { min, max } = this.zoomLensBounds();
+      if (lens < min || lens > max) throw new ProtocolError(`zoom lens position is outside ${min}..${max} for ${this.profile.id}`, "ZOOM_VALUE");
       if (this.color === 0x41) throw new ProtocolError("Pocket 4 Pro D-Log2 requires a D-Log hop before zoom", "ZOOM_STATE");
       return;
     }
+    if (this.profile.id === "pocket3" && payload[0] === 1 && payload[3] === 0 && payload[1] >= 0x48 && payload[1] <= 0x4a && payload[2] <= 1) return;
     if (payload[0] === 3 && payload[1] === 0) return;
     if (payload.equals(Buffer.from([0xff, 0, 0, 0]))) return;
     throw new ProtocolError("unknown zoom subcommand", "ZOOM_VERB");
+  }
+
+  zoomLensBounds({ shootingMode = this.shootingMode, videoResolution = this.videoResolution } = {}) {
+    if (this.profile.id === "nano") return { min: 217, max: 217 };
+    if (this.profile.id === "pocket4pro") {
+      return { min: 217, max: [0x00, 0x02, 0x28].includes(shootingMode) ? 651 : 2604 };
+    }
+    if (this.profile.id === "pocket4") return { min: 217, max: [0x00, 0x02, 0x28].includes(shootingMode) ? 217 : 868 };
+    if ([0x00, 0x02, 0x28].includes(shootingMode)) return { min: 217, max: 217 };
+    if (videoResolution === 0x10) return { min: 217, max: 434 };
+    if (videoResolution === 0x2d) return { min: 217, max: 651 };
+    return { min: 217, max: 868 };
   }
 
   apply(frame) {
@@ -453,7 +496,18 @@ export class MockCameraState {
       case "02/0c": this.inPlayback = frame.payload[3] === 1; if (this.inPlayback) this.liveEnabled = false; break;
       case "09/a8": this.liveEnabled = true; break;
       case "02/09": if (frame.payload[10] === 4) this.liveEnabled = false; break;
-      case "02/02": this.recording = frame.payload[0] === 1; break;
+      case "02/02":
+        if (frame.payload[0] === 1) {
+          this.recording = true;
+          this.recordingStartedAt = Date.now();
+        } else {
+          const durationSeconds = this.recordingElapsedSeconds();
+          this.recording = false;
+          this.recordingStartedAt = null;
+          this.addCapturedMedia("MP4", durationSeconds);
+        }
+        break;
+      case "02/01": this.addCapturedMedia("JPG", 0); break;
       case "02/e1": this.shootingMode = frame.payload[0]; break;
       case "08/e1": break;
       case "02/18": this.videoResolution = frame.payload[0]; this.videoFpsIndex = frame.payload[1]; break;
@@ -472,10 +526,42 @@ export class MockCameraState {
         break;
       case "02/9f": this.audioDsp = Buffer.from(frame.payload); break;
       case "02/a6": this.trackingBox = allZero(frame.payload) ? null : { id: frame.payload.readUInt16LE(3), x: frame.payload.readFloatLE(5), y: frame.payload.readFloatLE(9), width: frame.payload.readFloatLE(13), height: frame.payload.readFloatLE(17) }; this.tracking = Boolean(this.trackingBox); break;
-      case "02/b8": if (frame.payload[0] === 0x0a) this.zoomLens = u16le(frame.payload, 2); break;
-      case "04/01": this.gimbal.axis0 = u16le(frame.payload, 0); this.gimbal.axis1 = u16le(frame.payload, 4); break;
+      case "02/b8":
+        if (frame.payload[0] === 0x0a) this.zoomLens = u16le(frame.payload, 2);
+        else if (this.profile.id === "pocket3" && frame.payload[0] === 1) {
+          const bounds = this.zoomLensBounds();
+          this.zoomLens = frame.payload[2] === 1 ? bounds.max : bounds.min;
+        } else if (frame.payload[0] === 3) {
+          const bounds = this.zoomLensBounds();
+          const delta = u16le(frame.payload, 2) === 100 ? 217 : -217;
+          this.zoomLens = clamp(this.zoomLens + delta, bounds.min, bounds.max);
+        }
+        break;
+      case "04/01": {
+        const axis0 = u16le(frame.payload, 0);
+        const axis1 = u16le(frame.payload, 4);
+        this.gimbal.axis0 = axis0;
+        this.gimbal.axis1 = axis1;
+        // Stick values are velocities. A small deterministic integration keeps
+        // attitude pushes useful to clients without pretending to be a motor model.
+        this.gimbal.pitch = clamp(this.gimbal.pitch + (axis0 - 1024) / 550 * 1.2, -180, 180);
+        this.gimbal.yaw = clamp(this.gimbal.yaw + (axis1 - 1024) / 550 * 1.2, -48, 225);
+        break;
+      }
       case "04/14": this.gimbal.yaw = i16le(frame.payload, 0) / 10; this.gimbal.pitch = i16le(frame.payload, 4) / 10; break;
-      case "04/4c": if (frame.payload[0] === 0xfe && frame.payload[1] === 9) { this.gimbal.face = this.gimbal.face ? 0 : 1; this.gimbal.yaw = this.gimbal.face ? 180 : 0; } if (frame.payload[0] === 0xfe && frame.payload[1] === 8) { this.gimbal.yaw = 0; this.gimbal.pitch = 0; } break;
+      case "04/4c":
+        if (frame.payload[0] === 0xfe && frame.payload[1] === 9) {
+          this.gimbal.face = this.gimbal.face ? 0 : 1;
+          this.gimbal.yaw = this.gimbal.face ? 180 : 0;
+        }
+        if (frame.payload[0] === 0xfe && frame.payload[1] === 8) {
+          this.gimbal.yaw = 0;
+          this.gimbal.pitch = 0;
+        }
+        if (frame.payload[0] === 2 && frame.payload[1] === 8) this.gimbal.modeFamily = 2;
+        if (frame.payload[0] === 1 && frame.payload[1] === 8) this.gimbal.modeFamily = 1;
+        if (frame.payload[0] === 0 && frame.payload[1] === 8) this.gimbal.modeFamily = 0;
+        break;
       case "04/50": if (frame.payload[0] === 0) { if (frame.payload[1] === 4) this.gimbal.tiltLock = frame.payload[3]; if (frame.payload[1] === 5) this.gimbal.speed = frame.payload[3]; } break;
       case "00/28": this.media = this.media.filter((file) => file.handle !== u32le(frame.payload, 1)); break;
       case "02/bf": { const handle = u32le(frame.payload, 2); const item = this.media.find((file) => file.handle === handle); if (item) item.starred = frame.payload[11] === 1; break; }
@@ -487,6 +573,7 @@ export class MockCameraState {
     const pid = u16le(payload, 2);
     const value = payload.subarray(5);
     if (payload[0] !== 1) return;
+    if (pid === 0x0009) this.fov = value[0];
     if (pid === 0x000f) this.isoLimit = value[0];
     if (pid === 0x0020) this.audioChannel = value[0];
     if (pid === 0x0039) this.glamour = Buffer.from(value);
@@ -495,6 +582,7 @@ export class MockCameraState {
   }
 
   paramValue(pid) {
+    if (pid === 0x0009) return Buffer.from([this.fov]);
     if (pid === 0x000f) return Buffer.from([this.isoLimit]);
     if (pid === 0x0020) return Buffer.from([this.audioChannel]);
     if (pid === 0x0038) return Buffer.from([this.selfieFlip]);
@@ -502,6 +590,34 @@ export class MockCameraState {
     if (pid === 0x003b) return Buffer.from([1, this.focusTrack]);
     if (pid === 0x004c) return Buffer.from([this.vocalBoost]);
     throw new ProtocolError(`unsupported param 0x${pid.toString(16)}`, "UNSUPPORTED");
+  }
+
+  recordingElapsedSeconds() {
+    if (!this.recordingStartedAt) return 0;
+    return Math.max(0, Math.floor((Date.now() - this.recordingStartedAt) / 1000));
+  }
+
+  addCapturedMedia(extension, durationSeconds) {
+    const sequence = this.nextMediaCounter;
+    this.nextMediaCounter += 1;
+    const serial = String(sequence).padStart(4, "0");
+    const base = `DJI_202609131200${String(sequence).padStart(2, "0")}_${serial}_D`;
+    const isPhoto = extension === "JPG";
+    const file = {
+      path: `DCIM/100MEDIA/${base}.${extension}`,
+      thumbPath: `MISC/THM/100MEDIA/${base}.scr`,
+      handle: 0x40000000 + sequence,
+      sizeBytes: isPhoto ? 2048 : 4096,
+      durationSeconds,
+      starred: false,
+      storage: this.profile.internalStorage ? 1 : 0,
+      resolution: "3840x2160",
+      fps: isPhoto ? 0 : 25,
+    };
+    this.media.push(file);
+    const megabytes = Math.max(1, Math.ceil(file.sizeBytes / (1024 * 1024)));
+    if (file.storage === 1) this.internalFreeMb = Math.max(0, this.internalFreeMb - megabytes);
+    else this.sdFreeMb = Math.max(0, this.sdFreeMb - megabytes);
   }
 
   subscribedValue(name) {
@@ -518,10 +634,10 @@ export class MockCameraState {
       case "timecode_info": return timecodeValue();
       case "cam_expo_param": return this.expoValue();
       case "cam_video_param_v2": return Buffer.from([this.videoResolution, this.videoFpsIndex, 0, 0, 0]);
-      case "cam_record_time": return putU32le(this.recording ? 12 : 0);
+      case "cam_record_time": return putU32le(this.recordingElapsedSeconds());
       case "cam_image_effect": return this.imageEffectValue();
       case "cam_lens_state": return this.lensStateValue();
-      case "cam_fov": return putU32le(12287);
+      case "cam_fov": return putU32le(this.zoomFactorRaw());
       case "cam_audio_status_v2": return audioStatusValue();
       default: return Buffer.alloc(0);
     }
@@ -546,6 +662,14 @@ export class MockCameraState {
     return out;
   }
 
+  zoomFactorRaw() {
+    if (this.profile.id !== "pocket4pro") return 12287;
+    if (this.zoomLens <= 651) {
+      return Math.round(12287 - ((this.zoomLens - 217) * (12287 - 9368)) / (651 - 217));
+    }
+    return Math.round(9368 - ((this.zoomLens - 651) * (9368 - 2341)) / (2604 - 651));
+  }
+
   lensStateValue() {
     const out = Buffer.alloc(67);
     out[0] = this.focusMode === 2 ? 0xb2 : 0xb1;
@@ -567,8 +691,8 @@ export class MockCameraState {
     camera.writeUInt32LE((this.inPlayback ? 0x40000000 : 0) | (this.recording ? 0x80 : 0), 0);
     camera.writeUInt32LE(this.sdTotalMb, 5);
     camera.writeUInt32LE(this.sdFreeMb, 9);
-    camera.writeUInt32LE(this.recording ? 900 : 0, 17);
-    camera.writeUInt16LE(this.recording ? 12 : 0, 29);
+    camera.writeUInt32LE(this.recording ? Math.max(1, 900 - this.recordingElapsedSeconds()) : 0, 17);
+    camera.writeUInt16LE(this.recordingElapsedSeconds(), 29);
     camera[57] = this.shootingMode;
     const battery = Buffer.alloc(34);
     battery.writeUInt16LE(this.batteryMilliVolts, 1);
@@ -583,6 +707,7 @@ export class MockCameraState {
     ];
     if (this.profile.hasGimbal) {
       const attitude = Buffer.alloc(50);
+      attitude[6] = (this.gimbal.modeFamily & 0x03) << 6;
       attitude.writeInt16LE(Math.round(this.gimbal.yaw * 10), 4);
       attitude.writeInt16LE(Math.round(-this.gimbal.pitch * 10), 20);
       const face = Buffer.from([0, 0, this.gimbal.face ? 0x40 : 0]);
@@ -593,6 +718,10 @@ export class MockCameraState {
     }
     return frames;
   }
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
 }
 
 function readPacked(data, offset) {
